@@ -9,30 +9,121 @@ Script to run zonal statistics on batch rasters.
 USAGE
 - Have 1 shapefile to use for zonal extraction and 1 or more raster in a data folder.
 - THE SHAPEFILE AND THE RASTERS MUST ALL BE THE SAME PROJECTED (meters) CRS.
-- Run qa_runstats.py and answer the prompt questions. The tool will select autmatically the one shp and all rasters found in the folder. The ouput xlsx is generated in the data folder.
-- Use runstats.py for commandline execution (parallel processing)
-
+- Run qa_runstats.py and answer the prompt questions. 
+  The tool will select autmatically the one shp and all rasters found in the folder. 
+  The ouput xlsx is generated in the data folder.
+- Use runstats.py for direct commandline execution.
 """
 
-import os
-import pathlib
-from glob import glob
-from datetime import datetime
-import itertools as itools
+import rasterio
+from rasterio.mask import mask
+from rasterio.crs import CRS
+import shapely
+import pyproj
 
 import numpy as np
 import pandas as pd
 import geopandas as gpd
+
 from openpyxl import load_workbook
 
-import rasterio
-from rasterstats import zonal_stats
-
 try:
-    # Optional package for progress bar
     from tqdm import tqdm
 except ImportError:
     pass
+
+import itertools as itools
+from glob import glob
+import os
+
+
+def filter_geometries(shp, rst):
+    """Filter geometries to just those that overlay the given raster.
+
+    Parameters
+    ==========
+    * shp : GeoPandas DataFrame, shapefile data
+    * rst : rasterio raster object, raster data
+
+    Returns
+    =======
+    * GeoPandas DataFrame of geometries inside raster bounds
+    """
+    # Filter shapefile to geometries inside raster bounds
+    minx, miny, maxx, maxy = rst.bounds
+    bound_box = shapely.geometry.Polygon([(minx, miny), (minx, maxy), (maxx, maxy), (maxx, miny)])
+    relevant_geoms = shp[shp.geometry.within(bound_box)]
+
+    return relevant_geoms
+# End filter_geometries()
+
+
+def mp_calc_stats(in_data, preprocess=None):
+    """Calculate given statistics and populate result dict.
+
+    Compatible with multiprocessing methods.
+
+    Parameters
+    ==========
+    * in_data : tuple, (Pandas row, str, rasterio object, list, list, dict)
+    * preprocess : tuple[str, float], kind of preprocess with associated threshold value.
+                   ('SD', 2) : Filter values outside of 2 standard deviations
+                   ('PC', 80) : Filter values above 80th percentile
+    """
+    (row, field, ds, stats, ignore, result_set) = in_data
+
+    clip, out_transform = mask(ds, [row.geometry], crop=True)
+    clip = np.extract(clip != ds.nodata, clip)
+
+    if clip.size == 0:
+        # No data to process...
+        return
+
+    if ignore is not None:
+        for ig in ignore:
+            clip = np.extract(~np.isclose(clip, ig), clip)
+        # End for
+    # End if
+
+    if clip.size == 0:
+        # No data to process...
+        return
+
+    run_range = 'range' in stats
+    if run_range:
+        stats = [i for i in stats[:] if i != 'range']
+
+    # Early exit if everything is NaN
+    if np.isnan(clip).all():
+        return
+
+    # Apply preprocess if necessary
+    if preprocess:
+        kind, value = preprocess
+        if kind == 'SD':
+            sd = clip.std()
+            avg = clip.mean()
+            min_thres = (clip >= (avg - (sd * value)))
+            max_thres = (clip <= (avg + (sd * value)))
+            clip = clip[min_thres & max_thres]
+        elif kind == 'PC':
+            p_threshold = np.percentile(clip, value)
+            clip = clip[clip <= p_threshold]
+        # End if
+    # End if
+    
+    del ds
+    res = {func: float(getattr(np, func)(clip)) for func in stats}
+    res['count'] = clip.size
+
+    if run_range:
+        res['range'] = float(clip.max() - clip.min())
+
+    if any(res.values()):
+        idx = getattr(row, field)
+        result_set[idx] = res
+
+# End mp_calc_stats()
 
 
 def matching_crs(rst, shp_data):
@@ -49,18 +140,21 @@ def matching_crs(rst, shp_data):
                           and str for failure)
     """
     # Both vector and raster files have to have matching CRS
-    shp_crs = shp_data.crs['init']
-    rst_crs = rst.crs.to_string()
+    shp_str = shp_data.crs['init']
 
-    if "=" in rst_crs:
-        rst_crs = rst_crs.split("=")[1]
+    rst_crs = rst.crs
+    rst_str = rst_crs.to_string()
+    
+    pyCRS = pyproj.crs.CRS
+    rst_epsg = pyCRS.from_user_input(rst_str).to_epsg()
+    shp_epsg = pyCRS.from_user_input(shp_str).to_epsg()
+    crs_no_match = rst_epsg != shp_epsg
 
-    crs_no_match = shp_crs.lower() != rst_crs.lower()
     if crs_no_match:
         # CRS does not match
         issue = "Issues:"
-        issue += " Shapefile and raster have differing CRS."
-        issue += " shpfile: {}, raster: {}".format(shp_crs, rst_crs)
+        issue += " Shapefile and raster have differing EPSG."
+        issue += " shpfile: {}, raster: {}".format(shp_epsg, rst_epsg)
         
         return (False, issue)
     # End if
@@ -69,109 +163,117 @@ def matching_crs(rst, shp_data):
 # End matching_crs()
 
 
-def extract_stats(shp_files, rst_files, field,
-                  stats_of_interest, output_fn):
-    """Extract statistics from rasters using shapefiles.
+def write_to_excel(output_fn, results):
+    """Write data to a worksheet.
 
     Parameters
     ==========
-    * shp_file : list[str], paths to shapefiles
-    * rst_files : list[str], paths to raster files (in .tif format)
-    * field : str, field to run calculations for ("ADM0")
-    * stats_of_interest : str, listing statistical functions of interest
-                          `zonal_stats()` compatible
-    * output_fn : str, path and filename of output file
-
-    Returns
-    ==========
-    * None
-
-    Outputs
-    ==========
-    * Excel File : `sanity_check_[datetime of run].xlsx`
+    * output_fn : file pointer, pointer to raster file
+    * results : dict[tuple], of statistic in 
+                (geopandas df, sheet_name (str), comment (str))
     """
-    all_combinations = itools.product(*[shp_files, rst_files])
-
     try:
-        _loop = tqdm(all_combinations)
-    except NameError:
-        _loop = all_combinations
-    for shp, rst in _loop:
-        # Gets raster file name
-        sheet_name = os.path.basename(rst)
-        shp_name = os.path.basename(shp)
+        book = load_workbook(output_fn)
+        mode = 'a'
+    except FileNotFoundError:
+        book = None
+        mode = 'w'
+
+    # Write out data to excel file
+    with pd.ExcelWriter(output_fn, engine='openpyxl', mode=mode) as writer:
+        if book is not None:
+            writer.book = book
+            writer.sheets = {ws.title: ws for ws in book.worksheets}
+
+        # data, sheet_name, comment, msg=''
+        for data, sheet, comment in results.values():
+            # write out data first
+            if data is not None:
+                data.to_excel(writer, sheet, startrow=2, index=False)
+            else:
+                df = pd.DataFrame()
+                df.to_excel(writer, sheet, startrow=2)
+
+            if comment != '':
+                # then add comment (sheet has to exist first, hence the write out above)
+                worksheet = writer.sheets[sheet]
+                worksheet.cell(row=1, column=1).value = comment
+
+    # End with
+# End write_to_excel()
+
+
+def extract_stats(shp_files, rasters, field, stats, ignore=None, preprocess=None):
+    """Extract statistics from a raster using a shapefile.
+
+    Writes results to the specified output file.
+
+    Parameters
+    ==========
+    * shp_files : List[str], of file paths to shapefiles.
+    * rasters : List[str], of file paths to rasters.
+    * field : str, name of column to use as primary id.
+    * stats : List[str], of statistics to calculate. 
+              Numpy compatible method names only.
+    * ignore : List[float], of values to ignore.
+    """
+    all_combinations = itools.product(*[shp_files, rasters])
+
+    results = {}
+    shp_cache = {}
+    for shp_fn, rst_fn in all_combinations:
+        if shp_fn in shp_cache:
+            shp = shp_cache[shp_fn].copy()
+        else:
+            shp_cache = {}  # clear cache
+            shp = gpd.read_file(shp_fn)
+            shp_cache[shp_fn] = shp.copy()
+        # End if
+        
+        ds = rasterio.open(rst_fn)
+
+        sheet_name = os.path.basename(rst_fn)
+        shp_name = os.path.basename(shp_fn)
+
+        crs_matches, issue = matching_crs(ds, shp)
+        if not crs_matches:
+            cmt = "Could not process {} with {}.\n{}"\
+                    .format(sheet_name, shp_name, issue)
+            results[(shp_fn, rst_fn)] = None, sheet_name, cmt
+            continue
+        # End if
+
+        # Filter shapefile to geometries inside raster bounds
+        relevant_geoms = filter_geometries(shp, ds)
 
         try:
             # Set msg for progress bar if available
-            _loop.set_description("{} {} {}".format(shp_name, sheet_name, field))
-        except AttributeError:
-            pass
+            _loop = tqdm(relevant_geoms.itertuples())
+        except NameError:
+            _loop = relevant_geoms.itertuples()
 
-        shp_data = gpd.read_file(shp)
-        shp_data['area'] = shp_data.geometry.area
-        shp_data = shp_data.sort_values('area')
+        result_set = {}
+        for row in _loop:
+            mp_calc_stats((row, field, ds, stats, ignore, result_set), preprocess)
+        # End for
 
-        if field not in shp_data.columns:
-            print("Error: could not find {} in shapefile".format(field))
-            print("       Must be one of {}".format(shp_data.columns))
-            continue
+        stat_results = pd.DataFrame.from_dict(result_set, orient='index')
+        stat_results[field] = stat_results.index
 
-        with rasterio.open(rst) as src:
-            crs_matches, issue = matching_crs(src, shp_data)
-            if not crs_matches:
-                with pd.ExcelWriter(output_fn, engine='openpyxl')\
-                        as writer:
-                    df = pd.DataFrame()
-                    df.to_excel(writer, sheet_name, startrow=2)
-                    del df
+        res_shp = shp.merge(stat_results, on=field)
+        comment = "# Extracted from {} using {}".format(sheet_name,
+                                                        shp_name)
+        if preprocess is not None:
+            comment += "\n# Preprocessed using {} : {}".format(*preprocess)
 
-                    cmt = "Could not process {} with {}, incorrect CRS."\
-                            .format(sheet_name, shp_name)
-                    worksheet = writer.sheets[sheet_name]
-                    worksheet.cell(row=1, column=1).value = cmt
-                    worksheet.cell(row=2, column=1).value = issue
-                # End with
-                continue
-            # End if
+        results[(shp_fn, rst_fn)] = res_shp, sheet_name, comment
+    # End for
 
-            nodata = src.nodatavals
-            transform = src.transform
-            rst_data = src.read(1)
-            rst_data = np.ma.masked_array(rst_data, mask=(rst_data == nodata))
-        # End with
-
-        d_shp = shp_data.dissolve(by=field)
-        result = zonal_stats(d_shp, rst_data,
-                             affine=transform,
-                             stats=stats_of_interest,
-                             nodata=nodata,
-                             geojson_out=True)
-        geostats = gpd.GeoDataFrame.from_features(result)
-        df = pd.DataFrame(geostats)
-
-        # Filter out rows with empty data
-        df = df[(df.loc[:, stats_of_interest] > 0.0).any(axis=1)]
-
-        # Reset index name so it correctly appears when writing out to file
-        df.index.name = field
-
-        # Write out dataframe to excel file
-        try:
-            book = load_workbook(output_fn)
-        except FileNotFoundError:
-            book = None
-
-        # Write out data to excel file
-        with pd.ExcelWriter(output_fn, engine='openpyxl') as writer:
-            if book:
-                writer.book = book
-
-            df.to_excel(writer, sheet_name, startrow=2)
-            comment = "# Extracted from {} using {}"\
-                      .format(sheet_name,
-                              shp_name)
-            worksheet = writer.sheets[sheet_name]
-            worksheet.cell(row=1, column=1).value = comment
-        # End with
-    # End combination loop
+    return results
 # End extract_stats()
+
+
+def apply_extract(d, shp, rst, field, stats, ignore=None, preprocess=None):
+    from hazardstat import extract_stats
+    d.update(extract_stats([shp], [rst], field, stats, ignore, preprocess))
+    

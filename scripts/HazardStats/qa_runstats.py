@@ -1,24 +1,22 @@
-"""
-A question and answer approach to using schecker.py
-"""
-
-import argparse
+"""A question and answer approach to using HazardStats"""
 import pathlib
-from datetime import datetime
 from glob import glob
 import geopandas as gpd
 import os, sys
 
-from hazardstat import extract_stats
+from runstats import main
 
 
 if __name__ == '__main__':
-    in_dir = input("Input directory to use? ")
-    shp_file = glob(in_dir+"/*.shp")
-    if len(shp_file) > 1:
+    indir = input("Input directory to use? ")
+    shp_file = glob(indir+"/*.shp")
+    num_shp = len(shp_file)
+    if num_shp > 1:
         print("Found more than 1 shapefile! Aborting!")
         print(shp_file)
         sys.exit()
+    elif num_shp == 0:
+        sys.exit("No shapefile found!")
     shp_file = shp_file[0]
     shp_data = gpd.read_file(shp_file)
 
@@ -31,31 +29,65 @@ if __name__ == '__main__':
         sys.exit()
 
     stats = ["max", "min", "mean", "range", "sum"]
-    stats_in = input("What statistics to calculate? (default: {}) ".format(stats))
+    stats_in = input("What statistics to extract? (default: {}) ".format(stats))
     if stats_in != "":
         stats = stats_in.split()
 
-    rst_files = glob(in_dir+"/*.tif")
+    filtering = input("What filtering to apply? One of 'PC' or 'SD' (leave blank if none) ") or None
+    if filtering:
+        if filtering not in ['PC', 'SD']:
+            print("Unknown filtering! Has to be 'PC' or 'SD', got: {}".format(filtering))
+            sys.exit()
+        filter_val = input("What threshold/range value? ")
+        try:
+            filtering = (filtering, float(filter_val))
+        except ValueError:
+            print("Unexpected values, tried to parse: {} {}".format(filtering, filter_val))
+            print("Make sure these are correct.")
+            print("Examples of valid entries: PC 80 or SD 2")
+            sys.exit()
     
-    print("Calculating {} for {}, in {}".format(stats, 
+    ignore = input("Any values to ignore? (space separated, leave blank if none) ") or None
+    if ignore:
+        ignore = ignore.split()
+        ignore = [float(v) for v in ignore]
+
+    ncores = input("How many cores to use? (default: 1) ")
+    if ncores == '':
+        ncores = 1
+    else:
+        ncores = int(ncores)
+
+    rst_fns = glob(indir+"/*.tif")
+    print("Extracting {} for {}, in {} using {} cores\n".format(stats, 
                                                 field, 
-                                                shp_file))
+                                                shp_file,
+                                                ncores))
+    if filtering:
+        print("Before calculating stats, the following filter will be applied: {}".format(filtering))
+
     print("and doing the above for the following rasters:")
-    print(rst_files)
+    print(rst_fns, '\n')
     confirm = input("Is this correct? (Y/N) ")
     if "n" in confirm.lower():
         print("Aborting!")
         sys.exit()
 
-    output_fn = "{}/{}.{}.xlsx".format(in_dir, 
-                                       shp_file.replace(in_dir, "").replace(".shp", ""),
-                                       "_".join(stats))
+    stat_pp = "_".join(stats)
+    if filtering:
+        stat_pp += "_" + "_".join(map(str, filtering))
 
-    # openpyxl has trouble with relative paths
-    # convert to absolute path to avoid this issue
-    abs_output = pathlib.Path(output_fn)
-    abs_output = abs_output.resolve()
-    print("Outputting data to", abs_output)
+    output_fn = "{}/{}.{}.xlsx".format(indir, 
+                                       shp_file.replace(indir, "").replace(".shp", ""),
+                                       stat_pp)
 
-    extract_stats([shp_file], rst_files, field,
-                  stats, abs_output)
+    opts = {
+        'rst_fns': rst_fns,
+        'shp_fns': [shp_file],
+        'field': field,
+        'stats': stats,
+        'ncores': ncores,
+        'ignore': ignore,
+        'preprocess': filtering
+    }
+    main(output_fn, **opts)
